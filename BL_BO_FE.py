@@ -43,6 +43,7 @@ C_x0_model, C_N0_model, F_in_model, C_N_in_model, I0_model = 0.5, 1.0, 8e-3, 10.
 # --- Global state for the interactive experiment ---
 optimization_history = [] # Stores all evaluated points [x_params, y_value]
 optimizer = None # The scikit-optimize Optimizer object
+previewed_point = None # Stores the point from the "Preview" action
 
 # --- 2. Define the Photobioreactor ODE Model ---
 def pbr(t, C):
@@ -94,15 +95,15 @@ def set_ui_state(lock_all=False):
     has_points = len(experiments_source.data['C_x0']) > 0
     has_uncalculated_points = has_points and any(np.isnan(v) for v in experiments_source.data['Lutein'])
     has_calculated_points = has_points and not has_uncalculated_points
-    has_run_optimization = optimizer is not None
+    is_preview_pending = previewed_point is not None
 
     for widget in param_and_settings_widgets: widget.disabled = has_points
     
     generate_button.disabled = has_points
     reset_button.disabled = not has_points
     calculate_button.disabled = not has_uncalculated_points
-    optimize_button.disabled = not has_calculated_points
-    preview_button.disabled = not has_run_optimization
+    suggest_button.disabled = not has_calculated_points or is_preview_pending
+    run_suggestion_button.disabled = not is_preview_pending
 
 
 def get_current_dimensions():
@@ -121,9 +122,10 @@ def get_current_dimensions():
 
 def reset_experiment():
     """Resets the entire application state to the beginning."""
-    global optimization_history, optimizer
+    global optimization_history, optimizer, previewed_point
     optimization_history.clear()
     optimizer = None
+    previewed_point = None
 
     experiments_source.data = {k: [] for k in experiments_source.data}
     convergence_source.data = {k: [] for k in convergence_source.data}
@@ -190,113 +192,106 @@ def calculate_lutein_for_table():
                 current_lutein_col = experiments_source.data['Lutein']
                 for i, res_idx in enumerate(nan_indices): current_lutein_col[res_idx] = results[i]
                 experiments_source.patch({'Lutein': [(slice(len(current_lutein_col)), current_lutein_col)]})
-                update_status("✅ Calculation complete. Ready to run optimization.")
+                update_status("✅ Calculation complete. Ready to get a suggestion.")
                 set_ui_state()
             doc.add_next_tick_callback(callback)
         except Exception as e:
-            doc.add_next_tick_callback(lambda: update_status(f"❌ Error during calculation: {e}"))
+            error_message = f"❌ Error during calculation: {e}"
+            doc.add_next_tick_callback(lambda: update_status(error_message))
             doc.add_next_tick_callback(set_ui_state)
 
     threading.Thread(target=worker).start()
 
-def run_one_optimization_step():
-    """Asks the optimizer for a point, evaluates it, and updates the model."""
-    update_status("🔄 Running one optimization step...")
-    set_ui_state(lock_all=True)
-    
-    def worker():
-        global optimizer
-        try:
-            # Create optimizer on first run and feed it initial data
-            if optimizer is None:
-                dims = get_current_dimensions()
-                optimizer = Optimizer(
-                    dimensions=dims,
-                    base_estimator=surrogate_select.value,
-                    acq_func=acq_func_select.value,
-                    random_state=np.random.randint(1000)
-                )
-                x_history = [item[0] for item in optimization_history]
-                y_history = [item[1] for item in optimization_history]
-                optimizer.tell(x_history, y_history)
-            
-            # 1. Ask for the next point
-            point_to_run = optimizer.ask()
-
-            # 2. Evaluate it
-            obj_val = _evaluate_lutein_model_objective(*point_to_run)
-            lutein_val = -obj_val
-            
-            # 3. Tell the optimizer the result so it can learn
-            optimizer.tell(point_to_run, obj_val)
-            
-            # 4. Update our own history and UI
-            optimization_history.append([point_to_run, obj_val])
-
-            def callback():
-                new_point_data = {
-                    'C_x0': [point_to_run[0]], 'C_N0': [point_to_run[1]], 'F_in': [point_to_run[2]],
-                    'C_N_in': [point_to_run[3]], 'I0': [point_to_run[4]], 'Lutein': [lutein_val]
-                }
-                experiments_source.stream(new_point_data)
-                
-                # FIX 1: Correctly calculate the optimization step number
-                opt_step_number = len(optimization_history) - n_initial_input.value
-                update_status(f"✅ Optimization Step {opt_step_number} complete. New Lutein: {lutein_val:.4f} g/L")
-                
-                suggestion_div.text = "" # Clear any old previews
-                process_and_plot_latest_results()
-                set_ui_state()
-            doc.add_next_tick_callback(callback)
-
-        except Exception as e:
-            doc.add_next_tick_callback(lambda: update_status(f"❌ Error in optimization step: {e}"))
-            doc.add_next_tick_callback(set_ui_state)
-
-    threading.Thread(target=worker).start()
-
-def preview_next_suggestion():
-    """Asks the optimizer for the next best point to sample, without running it."""
+def _ensure_optimizer_is_ready():
+    """Internal helper to create and prime the optimizer if it doesn't exist."""
+    global optimizer
     if optimizer is None:
-        update_status("Run at least one optimization step before previewing.")
-        return
+        dims = get_current_dimensions()
+        x_history = [item[0] for item in optimization_history]
+        y_history = [item[1] for item in optimization_history]
+        
+        optimizer = Optimizer(
+            dimensions=dims,
+            base_estimator=surrogate_select.value,
+            acq_func=acq_func_select.value,
+            n_initial_points=len(x_history), 
+            random_state=np.random.randint(1000)
+        )
+        
+        if x_history:
+            optimizer.tell(x_history, y_history)
 
+def suggest_next_experiment():
+    """Asks the optimizer for the next best point to sample, without running it."""
+    global previewed_point
     update_status("🔄 Getting next suggestion preview...")
     set_ui_state(lock_all=True)
 
     def worker():
+        global previewed_point
         try:
-            # Ask the optimizer for its next best guess
+            _ensure_optimizer_is_ready()
             next_point = optimizer.ask()
-            # Use the fitted model to predict the outcome at the suggested point
+            previewed_point = next_point # Store for the 'Run' button
             mean, std = optimizer.models[-1].predict([next_point], return_std=True)
-            
-            # The objective is negative lutein, so flip the sign for prediction
             predicted_lutein = -mean[0]
             uncertainty = std[0]
 
             def callback():
                 names = [d.name for d in get_current_dimensions()]
-                suggestion_html = "<h5>Preview of Next Suggestion:</h5>"
+                suggestion_html = "<h5>Suggested Next Experiment:</h5>"
                 suggestion_html += f"<b>Predicted Lutein: {predicted_lutein:.4f} ± {uncertainty:.4f} g/L</b><ul>"
                 for name, val in zip(names, next_point):
                     suggestion_html += f"<li><b>{name}:</b> {val:.4f}</li>"
-                suggestion_html += "</ul><p><i>Note: This is the model's prediction. Click 'Run One Optimization Step' to perform this experiment and see the actual result.</i></p>"
+                suggestion_html += "</ul>"
                 suggestion_div.text = suggestion_html
-                update_status("💡 Preview received.")
+                update_status("💡 Suggestion received. You can now run this specific experiment.")
                 set_ui_state()
             doc.add_next_tick_callback(callback)
         except Exception as e:
-            doc.add_next_tick_callback(lambda: update_status(f"❌ Error getting preview: {e}"))
+            error_message = f"❌ Error getting preview: {e}"
+            doc.add_next_tick_callback(lambda: update_status(error_message))
             doc.add_next_tick_callback(set_ui_state)
-            
     threading.Thread(target=worker).start()
+    
+def run_suggestion():
+    """Runs the specific experiment that was previewed."""
+    if previewed_point is None: return
+    update_status("🔄 Running suggested experiment...")
+    set_ui_state(lock_all=True)
+
+    def worker():
+        global previewed_point
+        try:
+            point_to_run = previewed_point
+            obj_val = _evaluate_lutein_model_objective(*point_to_run)
+            lutein_val = -obj_val
+            optimizer.tell(point_to_run, obj_val)
+            optimization_history.append([point_to_run, obj_val])
+            
+            def callback():
+                global previewed_point
+                new_point_data = {'C_x0': [point_to_run[0]],'C_N0': [point_to_run[1]],'F_in': [point_to_run[2]],'C_N_in': [point_to_run[3]],'I0': [point_to_run[4]],'Lutein': [lutein_val]}
+                experiments_source.stream(new_point_data)
+                opt_step_number = len(optimization_history) - n_initial_input.value
+                update_status(f"✅ Ran suggested experiment as Step {opt_step_number}. Lutein: {lutein_val:.4f} g/L")
+                previewed_point = None
+                suggestion_div.text = ""
+                process_and_plot_latest_results()
+                set_ui_state()
+            doc.add_next_tick_callback(callback)
+        except Exception as e:
+            error_message = f"❌ Error running suggestion: {e}"
+            doc.add_next_tick_callback(lambda: update_status(error_message))
+            doc.add_next_tick_callback(set_ui_state)
+
+    threading.Thread(target=worker).start()
+
 
 def process_and_plot_latest_results():
     """Finds the best result from the history and updates plots."""
     if not optimization_history: return
     
-    # FIX 2: Find the best result from the history, not the optimizer object
     best_item = min(optimization_history, key=lambda item: item[1])
     best_params, best_obj_val = best_item[0], best_item[1]
     
@@ -316,7 +311,6 @@ def process_and_plot_latest_results():
 def update_convergence_plot_from_history():
     """Recalculates and updates the entire convergence plot from the history."""
     num_initial = n_initial_input.value
-    # Correctly identify optimization steps as points AFTER the initial ones
     opt_history = optimization_history[num_initial:]
     if not opt_history:
         convergence_source.data = dict(iter=[], best_lutein=[])
@@ -325,7 +319,6 @@ def update_convergence_plot_from_history():
     iters = list(range(1, len(opt_history) + 1))
     best_lutein_so_far = []
     
-    # Find best result from the initial points to serve as the starting point for the plot
     initial_points_history = optimization_history[:num_initial]
     current_best = -min(p[1] for p in initial_points_history) if initial_points_history else -np.inf
 
@@ -345,15 +338,7 @@ def run_final_simulation(best_params):
     initial_conditions = [best_params[0], best_params[1], 0.0]
     sol = solve_ivp(pbr, [0, 150], initial_conditions, t_eval=t_eval, method="RK45")
     
-    # Clip values at 0 to prevent plotting negative concentrations from numerical noise
-    # and scale Lutein for better visibility.
-    simulation_source.data = {
-        "time": sol.t, 
-        "C_X": np.maximum(0, sol.y[0]), 
-        "C_N": np.maximum(0, sol.y[1]), 
-        "C_L": np.maximum(0, sol.y[2]),
-        "C_L_scaled": np.maximum(0, sol.y[2]) * 100
-    }
+    simulation_source.data = {"time": sol.t, "C_X": np.maximum(0, sol.y[0]), "C_N": np.maximum(0, sol.y[1]), "C_L": np.maximum(0, sol.y[2]), "C_L_scaled": np.maximum(0, sol.y[2]) * 100}
 
 def update_status(message): status_div.text = message
 
@@ -374,23 +359,23 @@ settings_title = Div(text="<h4>2. Configure Initial Sampling & Model</h4>")
 surrogate_select = Select(title="Surrogate Model:", value="GP", options=["GP", "RF", "ET"])
 acq_func_select = Select(title="Acquisition Function:", value="gp_hedge", options=["gp_hedge", "EI", "PI", "LCB"])
 sampler_select = Select(title="Sampling Method:", value="LHS", options=["LHS", "Sobol", "Random"])
-n_initial_input = Spinner(title="Number of Initial Points:", low=1, step=1, value=10, width=150)
+n_initial_input = Spinner(title="Number of Initial Points:", low=1, step=1, value=5, width=150)
 param_and_settings_widgets = [cx0_range, cn0_range, fin_range, cnin_range, i0_range, surrogate_select, acq_func_select, sampler_select, n_initial_input]
 
 # Step 3: Experiment Workflow
 actions_title = Div(text="<h4>3. Run Experiment Workflow</h4>")
 generate_button = Button(label="A) Generate Initial Points", button_type="primary", width=400)
 calculate_button = Button(label="B) Calculate Lutein for Initial Points", button_type="default", width=400)
-optimize_button = Button(label="C) Run One Optimization Step", button_type="success", width=400)
-preview_button = Button(label="D) Preview Next Suggestion", button_type="warning", width=400)
+suggest_button = Button(label="C) Suggest Next Experiment & Show Prediction", button_type="success", width=400)
 suggestion_div = Div(text="", width=400)
+run_suggestion_button = Button(label="D) Run Suggested Experiment & Update Model", button_type="warning", width=400)
 reset_button = Button(label="Reset Experiment", button_type="danger", width=400)
-all_buttons = [generate_button, calculate_button, optimize_button, preview_button, reset_button]
+all_buttons = [generate_button, calculate_button, suggest_button, run_suggestion_button, reset_button]
 
 generate_button.on_click(generate_initial_points)
 calculate_button.on_click(calculate_lutein_for_table)
-optimize_button.on_click(run_one_optimization_step)
-preview_button.on_click(preview_next_suggestion)
+suggest_button.on_click(suggest_next_experiment)
+run_suggestion_button.on_click(run_suggestion)
 reset_button.on_click(reset_experiment)
 
 status_div = Div(text="🟢 Ready. Define parameters and generate initial points.")
@@ -418,7 +403,7 @@ controls_col = column(
     title_div, description_p,
     param_range_title, cx0_range, cn0_range, fin_range, cnin_range, i0_range,
     settings_title, surrogate_select, acq_func_select, sampler_select, n_initial_input,
-    actions_title, generate_button, calculate_button, optimize_button, preview_button, suggestion_div, reset_button,
+    actions_title, generate_button, calculate_button, suggest_button, suggestion_div, run_suggestion_button, reset_button,
     status_div,
     width=470,
 )
