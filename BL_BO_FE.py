@@ -1,10 +1,8 @@
 import numpy as np
 from scipy.integrate import solve_ivp
-from skopt import gp_minimize
+from skopt import Optimizer
 from skopt.space import Real
-from skopt.utils import use_named_args
 from skopt.sampler import Lhs, Sobol
-import math
 import threading
 
 from bokeh.plotting import figure, curdoc
@@ -13,388 +11,413 @@ from bokeh.models import (
     ColumnDataSource,
     Button,
     Select,
-    TextInput,
     Div,
     Spinner,
     Paragraph,
+    DataTable,
+    TableColumn,
+    NumberFormatter,
+    RangeSlider,
+    LinearAxis,
+    DataRange1d,
 )
 
 # --- 1. Define Model Parameters (Constants of the Lutein system) ---
-# These constants describe the biological and physical properties of the system.
-U_M = 0.152  # Maximum specific growth rate (1/h)
-U_D = 5.95e-3  # Specific death/decay rate (1/h)
-K_N = 30.0e-3  # Monod constant for nitrate (g/L)
-Y_NX = 0.305  # Yield coefficient of biomass on nitrate (g/g)
-K_M = 0.350e-3 * 2  # Maximum specific lutein production rate (g/g-h)
-K_D = 3.71 * 0.05 / 90  # Specific lutein degradation rate (L/g-h)
-K_NL = 10.0e-3  # Monod constant for nitrate for lutein production (g/L)
-K_S = 142.8  # Light saturation constant for growth (umol/m2-s)
-K_I = 214.2  # Light inhibition constant for growth (umol/m2-s)
-K_SL = 320.6  # Light saturation constant for lutein production (umol/m2-s)
-K_IL = 480.9  # Light inhibition constant for lutein production (umol/m2-s)
-TAU = 0.120  # Light attenuation coefficient (m2/g)
-KA = 0.0  # Placeholder constant
+U_M = 0.152
+U_D = 5.95e-3
+K_N = 30.0e-3
+Y_NX = 0.305
+K_M = 0.350e-3 * 2
+K_D = 3.71 * 0.05 / 90
+K_NL = 10.0e-3
+K_S = 142.8
+K_I = 214.2
+K_SL = 320.6
+K_IL = 480.9
+TAU = 0.120
+KA = 0.0
 
 # --- Global Variables for ODE solver ---
-# These are used by the 'pbr' function. They are set globally because
-# solve_ivp's standard interface doesn't easily pass extra parameters
-# without wrapping the function in a lambda or class. This approach is kept
-# from the original code for consistency.
-C_x0_model = 0.5
-C_N0_model = 1.0
-F_in_model = 8e-3
-C_N_in_model = 10.0
-I0_model = 150.0
+C_x0_model, C_N0_model, F_in_model, C_N_in_model, I0_model = 0.5, 1.0, 8e-3, 10.0, 150.0
 
+# --- Global state for the interactive experiment ---
+optimization_history = [] # Stores all evaluated points [x_params, y_value]
+optimizer = None # The scikit-optimize Optimizer object
 
 # --- 2. Define the Photobioreactor ODE Model ---
 def pbr(t, C):
-    """
-    Defines the system of Ordinary Differential Equations for the photobioreactor.
-    C[0]: Biomass concentration (C_X)
-    C[1]: Nitrate concentration (C_N)
-    C[2]: Lutein concentration (C_L)
-    """
+    """Defines the system of Ordinary Differential Equations for the photobioreactor."""
     C_X, C_N, C_L = C
-
-    # Avoid division by zero or negative concentrations in the model
     if C_X < 1e-9: C_X = 1e-9
     if C_N < 1e-9: C_N = 1e-9
     if C_L < 1e-9: C_L = 1e-9
 
-    # Light availability calculation (Beer-Lambert law)
     I = 2 * I0_model * (np.exp(-(TAU * 0.01 * 1000 * C_X)))
-
-    # Light scaling factors for growth (u) and lutein production (k)
     Iscaling_u = I / (I + K_S + I ** 2 / K_I)
     Iscaling_k = I / (I + K_SL + I ** 2 / K_IL)
-
-    # Specific rates for growth and lutein production
     u0 = U_M * Iscaling_u
     k0 = K_M * Iscaling_k
 
-    # ODEs for each component
     dCxdt = u0 * C_N * C_X / (C_N + K_N) - U_D * C_X
     dCndt = -Y_NX * u0 * C_N * C_X / (C_N + K_N) + F_in_model * C_N_in_model
     dCldt = k0 * C_N * C_X / (C_N + K_NL) - K_D * C_L * C_X
-
     return np.array([dCxdt, dCndt, dCldt])
 
-
 # --- 3. Helper function to evaluate the model and objective ---
-def _evaluate_lutein_model_objective(C_x0, C_N0, F_in, C_N_in, I0):
-    """
-    Sets up and runs a single simulation to find the final lutein concentration.
-    This is the core function that the optimizer will try to minimize (negative of).
-    """
+def _evaluate_lutein_model_objective(*args):
+    """Sets up and runs a single simulation to find the final lutein concentration."""
     global C_x0_model, C_N0_model, F_in_model, C_N_in_model, I0_model
-    C_x0_model, C_N0_model, F_in_model, C_N_in_model, I0_model = (
-        C_x0, C_N0, F_in, C_N_in, I0
-    )
+    C_x0_model, C_N0_model, F_in_model, C_N_in_model, I0_model = args
+    
+    sol = solve_ivp(pbr, [0, 150], [C_x0_model, C_N0_model, 0.0], t_eval=[150], method="RK45")
+    final_lutein = sol.y[2, -1]
+    if not np.isfinite(final_lutein) or final_lutein <= 0:
+        return 1e6  # Penalty for non-physical results
+    return -final_lutein # Return negative because optimizer minimizes
 
-    time_span = [0, 150]
-    initial_conditions = np.array([C_x0_model, C_N0_model, 0.0])
-
-    # Solve the ODE system
-    sol = solve_ivp(
-        pbr, time_span, initial_conditions, t_eval=[150], method="RK45"
-    )
-    final_lutein_concentration = sol.y[2, -1]
-
-    # The optimizer minimizes, so we return the negative of our goal (lutein)
-    # Return a large number if the result is invalid to guide the search away.
-    if final_lutein_concentration <= 0 or not np.isfinite(final_lutein_concentration):
-        return 1e6  # A large penalty for non-physical results
-
-    return -final_lutein_concentration
-
-
-# --- 4. Define the Search Space and Objective Function for skopt ---
-dimensions = [
-    Real(0.2, 2.0, name="C_x0"),
-    Real(0.2, 2.0, name="C_N0"),
-    Real(1e-3, 1.5e-2, name="F_in"),
-    Real(5.0, 15.0, name="C_N_in"),
-    Real(100.0, 200.0, name="I0"),
-]
-
-@use_named_args(dimensions)
-def objective_function(C_x0, C_N0, F_in, C_N_in, I0):
-    """Wrapper for skopt to call the evaluation function with named arguments."""
-    return _evaluate_lutein_model_objective(C_x0, C_N0, F_in, C_N_in, I0)
-
-
-# --- 5. Bokeh Application Setup ---
-
-# --- Data Sources ---
-# Source for the convergence plot (iteration vs. best lutein found)
-convergence_source = ColumnDataSource(data=dict(iter=[], best_lutein=[]))
-
-# Source for the final simulation plot (time vs. concentrations)
-simulation_source = ColumnDataSource(
-    data=dict(time=[], C_X=[], C_N=[], C_L=[])
-)
-
-
-# --- Callbacks and Update Functions ---
-
-def run_optimization():
-    """
-    Triggered by the 'Start' button.
-    Reads UI parameters, disables widgets, and starts the optimization in a new thread.
-    """
-    # Disable controls during run
-    start_button.disabled = True
-    for widget in control_widgets:
-        widget.disabled = True
-
-    # Clear previous results and plots
-    status_div.text = "🔄 Optimization in progress... please wait."
-    results_div.text = ""
-    convergence_source.data = dict(iter=[], best_lutein=[])
-    simulation_source.data = dict(time=[], C_X=[], C_N=[], C_L=[])
-
-    # Start the potentially long-running optimization in a separate thread
-    # This prevents the UI from freezing.
-    thread = threading.Thread(target=threaded_optimization_worker)
-    thread.start()
-
-
-def threaded_optimization_worker():
-    """
-    The main worker function that runs gp_minimize.
-    This function runs in a separate thread to avoid blocking the Bokeh server.
-    """
-    # Get parameters from the UI widgets
-    n_calls = int(n_calls_input.value)
-    n_initial = int(n_initial_input.value)
-    surrogate_model = surrogate_select.value
-    acq_func = acq_func_select.value
-    sampler_choice = sampler_select.value
-
-    # Validate inputs
-    if n_initial >= n_calls:
-        doc.add_next_tick_callback(
-            lambda: update_status(
-                "❌ Error: Number of initial points must be less than total iterations.",
-                is_error=True,
-            )
-        )
-        return
-
-    # --- Generate Initial Points ---
-    x0, y0 = None, None
-    if n_initial > 0:
-        if sampler_choice == 'lhs':
-            sampler = Lhs(lhs_type="centered", criterion="maximin")
-            x0 = sampler.generate(dimensions, n_samples=n_initial, random_state=42)
-        elif sampler_choice == 'sobol':
-            sampler = Sobol()
-            x0 = sampler.generate(dimensions, n_samples=n_initial, random_state=42)
-        # 'random' is handled by gp_minimize directly if x0 is None
-
-    try:
-        # Define the callback for gp_minimize to update the plot live
-        def skopt_callback(res):
-            iteration = len(res.func_vals)
-            best_lutein = -res.fun
-            # Schedule UI update to be run by the Bokeh server's main IOLoop
-            doc.add_next_tick_callback(
-                lambda: update_convergence_plot(iteration, best_lutein)
-            )
-
-        # --- Run Bayesian Optimization ---
-        result = gp_minimize(
-            func=objective_function,
-            dimensions=dimensions,
-            base_estimator=surrogate_model,
-            acq_func=acq_func,
-            n_calls=n_calls,
-            x0=x0,
-            n_initial_points=n_initial if x0 is None else 0,
-            random_state=42,
-            callback=[skopt_callback],
-        )
-
-        # --- Process and Display Final Results ---
-        # Schedule the final updates to be run by the main IOLoop
-        doc.add_next_tick_callback(
-            lambda: process_final_results(result)
-        )
-
-    except Exception as e:
-        error_message = f"❌ An error occurred during optimization: {e}"
-        doc.add_next_tick_callback(lambda: update_status(error_message, is_error=True))
-
-
-def process_final_results(result):
-    """
-    Once optimization is complete, this function updates the results text
-    and runs/plots the final simulation with the optimal parameters.
-    """
-    status_div.text = "✅ Optimization complete."
-
-    # --- Display Optimal Parameters ---
-    max_lutein = -result.fun
-    optimal_params = {dim.name: val for dim, val in zip(dimensions, result.x)}
-
-    results_html = f"<h3>Optimal Results</h3>"
-    results_html += f"<b>Maximum Lutein Concentration:</b> {-result.fun:.4f} g/L<br/>"
-    results_html += "<b>Optimal Parameters:</b><ul>"
-    for param, value in optimal_params.items():
-        results_html += f"<li><b>{param}:</b> {value:.4f}</li>"
-    results_html += "</ul>"
-    results_div.text = results_html
-
-    # --- Run and Plot the Final Simulation ---
-    C_x0, C_N0, F_in, C_N_in, I0 = result.x
-    global C_x0_model, C_N0_model, F_in_model, C_N_in_model, I0_model
-    C_x0_model, C_N0_model, F_in_model, C_N_in_model, I0_model = (
-        C_x0, C_N0, F_in, C_N_in, I0
-    )
-    time_span = [0, 150]
-    t_eval = np.linspace(time_span[0], time_span[1], 300)
-    initial_conditions = np.array([C_x0_model, C_N0_model, 0.0])
-
-    sol = solve_ivp(
-        pbr, time_span, initial_conditions, t_eval=t_eval, method="RK45"
-    )
-
-    # Update the simulation plot's data source
-    simulation_source.data = {
-        "time": sol.t,
-        "C_X": sol.y[0],
-        "C_N": sol.y[1],
-        "C_L": sol.y[2],
-    }
-
-    # Re-enable controls
-    start_button.disabled = False
-    for widget in control_widgets:
-        widget.disabled = False
-
-
-def update_convergence_plot(iteration, best_lutein):
-    """Updates the convergence plot data source by streaming new data."""
-    convergence_source.stream({"iter": [iteration], "best_lutein": [best_lutein]})
-
-def update_status(message, is_error=False):
-    """Updates the status Div and re-enables controls in case of an error."""
-    status_div.text = message
-    if is_error:
-        start_button.disabled = False
-        for widget in control_widgets:
-            widget.disabled = False
-
-
-# --- UI Widgets ---
+# --- 4. Bokeh Application Setup ---
 doc = curdoc()
 doc.title = "Lutein Production Optimizer"
 
-# --- Control Widgets ---
+# --- Data Sources ---
+convergence_source = ColumnDataSource(data=dict(iter=[], best_lutein=[]))
+simulation_source = ColumnDataSource(data=dict(time=[], C_X=[], C_N=[], C_L=[], C_L_scaled=[]))
+experiments_source = ColumnDataSource(data=dict(C_x0=[], C_N0=[], F_in=[], C_N_in=[], I0=[], Lutein=[]))
+
+# --- UI and Workflow Functions ---
+def set_ui_state(lock_all=False):
+    """Central function to manage the enabled/disabled state of all buttons."""
+    if lock_all:
+        for w in all_buttons: w.disabled = True
+        return
+
+    has_points = len(experiments_source.data['C_x0']) > 0
+    has_uncalculated_points = has_points and any(np.isnan(v) for v in experiments_source.data['Lutein'])
+    has_calculated_points = has_points and not has_uncalculated_points
+    has_run_optimization = optimizer is not None
+
+    for widget in param_and_settings_widgets: widget.disabled = has_points
+    
+    generate_button.disabled = has_points
+    reset_button.disabled = not has_points
+    calculate_button.disabled = not has_uncalculated_points
+    optimize_button.disabled = not has_calculated_points
+    preview_button.disabled = not has_run_optimization
+
+
+def get_current_dimensions():
+    """Reads parameter ranges from UI and creates skopt dimension objects."""
+    try:
+        return [
+            Real(cx0_range.value[0], cx0_range.value[1], name="C_x0"),
+            Real(cn0_range.value[0], cn0_range.value[1], name="C_N0"),
+            Real(fin_range.value[0], fin_range.value[1], name="F_in", prior='log-uniform'),
+            Real(cnin_range.value[0], cnin_range.value[1], name="C_N_in"),
+            Real(i0_range.value[0], i0_range.value[1], name="I0"),
+        ]
+    except Exception as e:
+        update_status(f"❌ Error creating dimensions: {e}")
+        return None
+
+def reset_experiment():
+    """Resets the entire application state to the beginning."""
+    global optimization_history, optimizer
+    optimization_history.clear()
+    optimizer = None
+
+    experiments_source.data = {k: [] for k in experiments_source.data}
+    convergence_source.data = {k: [] for k in convergence_source.data}
+    simulation_source.data = {k: [] for k in simulation_source.data}
+    
+    suggestion_div.text = ""
+    results_div.text = ""
+    update_status("🟢 Ready. Define parameters and generate initial points.")
+    set_ui_state()
+
+def generate_initial_points():
+    """Generates initial experimental points based on UI settings."""
+    update_status("🔄 Generating initial points...")
+    set_ui_state(lock_all=True)
+    dims = get_current_dimensions()
+    if dims is None: set_ui_state(); return
+
+    n_initial = n_initial_input.value
+    sampler_choice = sampler_select.value
+    
+    try:
+        if sampler_choice == 'LHS':
+            sampler = Lhs(lhs_type="centered", criterion="maximin")
+            x0 = sampler.generate(dims, n_samples=n_initial)
+        elif sampler_choice == 'Sobol':
+            sampler = Sobol()
+            x0 = sampler.generate(dims, n_samples=n_initial, random_state=np.random.randint(1000))
+        else: # Random
+            x0 = [ [d.rvs(1)[0] for d in dims] for _ in range(n_initial) ]
+
+        new_data = {name.name: [point[i] for point in x0] for i, name in enumerate(dims)}
+        new_data['Lutein'] = [np.nan] * n_initial
+        experiments_source.data = new_data
+        
+        update_status("🟢 Generated initial points. Ready to calculate.")
+    except Exception as e:
+        update_status(f"❌ Error generating points: {e}")
+    finally:
+        set_ui_state()
+
+def calculate_lutein_for_table():
+    """Runs simulation for the points in the table."""
+    update_status("🔄 Calculating Lutein for initial points...")
+    set_ui_state(lock_all=True)
+
+    def worker():
+        try:
+            points_to_calc, nan_indices = [], [i for i, v in enumerate(experiments_source.data['Lutein']) if np.isnan(v)]
+            if not nan_indices:
+                doc.add_next_tick_callback(lambda: update_status("🟢 All points already calculated."))
+                doc.add_next_tick_callback(set_ui_state); return
+                
+            for i in nan_indices: points_to_calc.append([experiments_source.data[name][i] for name in ['C_x0', 'C_N0', 'F_in', 'C_N_in', 'I0']])
+
+            results = []
+            for i, p in enumerate(points_to_calc):
+                doc.add_next_tick_callback(lambda i=i: update_status(f"🔄 Calculating point {i+1}/{len(points_to_calc)}..."))
+                obj_val = _evaluate_lutein_model_objective(*p)
+                results.append(-obj_val) # Store positive lutein value
+                if not any(np.array_equal(p, item[0]) for item in optimization_history):
+                    optimization_history.append([p, obj_val])
+
+            def callback():
+                current_lutein_col = experiments_source.data['Lutein']
+                for i, res_idx in enumerate(nan_indices): current_lutein_col[res_idx] = results[i]
+                experiments_source.patch({'Lutein': [(slice(len(current_lutein_col)), current_lutein_col)]})
+                update_status("✅ Calculation complete. Ready to run optimization.")
+                set_ui_state()
+            doc.add_next_tick_callback(callback)
+        except Exception as e:
+            doc.add_next_tick_callback(lambda: update_status(f"❌ Error during calculation: {e}"))
+            doc.add_next_tick_callback(set_ui_state)
+
+    threading.Thread(target=worker).start()
+
+def run_one_optimization_step():
+    """Asks the optimizer for a point, evaluates it, and updates the model."""
+    update_status("🔄 Running one optimization step...")
+    set_ui_state(lock_all=True)
+    
+    def worker():
+        global optimizer
+        try:
+            # Create optimizer on first run and feed it initial data
+            if optimizer is None:
+                dims = get_current_dimensions()
+                optimizer = Optimizer(
+                    dimensions=dims,
+                    base_estimator=surrogate_select.value,
+                    acq_func=acq_func_select.value,
+                    random_state=np.random.randint(1000)
+                )
+                x_history = [item[0] for item in optimization_history]
+                y_history = [item[1] for item in optimization_history]
+                optimizer.tell(x_history, y_history)
+            
+            # 1. Ask for the next point
+            point_to_run = optimizer.ask()
+
+            # 2. Evaluate it
+            obj_val = _evaluate_lutein_model_objective(*point_to_run)
+            lutein_val = -obj_val
+            
+            # 3. Tell the optimizer the result so it can learn
+            opt_result = optimizer.tell(point_to_run, obj_val)
+            
+            # 4. Update our own history and UI
+            optimization_history.append([point_to_run, obj_val])
+
+            def callback():
+                new_point_data = {
+                    'C_x0': [point_to_run[0]], 'C_N0': [point_to_run[1]], 'F_in': [point_to_run[2]],
+                    'C_N_in': [point_to_run[3]], 'I0': [point_to_run[4]], 'Lutein': [lutein_val]
+                }
+                experiments_source.stream(new_point_data)
+                update_status(f"✅ Step {len(optimization_history)} complete. New Lutein: {lutein_val:.4f} g/L")
+                suggestion_div.text = "" # Clear any old previews
+                process_and_plot_latest_results(opt_result)
+                set_ui_state()
+            doc.add_next_tick_callback(callback)
+
+        except Exception as e:
+            doc.add_next_tick_callback(lambda: update_status(f"❌ Error in optimization step: {e}"))
+            doc.add_next_tick_callback(set_ui_state)
+
+    threading.Thread(target=worker).start()
+
+def preview_next_suggestion():
+    """Asks the optimizer for the next best point to sample, without running it."""
+    if optimizer is None:
+        update_status("Run at least one optimization step before previewing.")
+        return
+
+    update_status("🔄 Getting next suggestion preview...")
+    set_ui_state(lock_all=True)
+
+    def worker():
+        try:
+            # Ask the optimizer for its next best guess
+            next_point = optimizer.ask()
+            # Use the fitted model to predict the outcome at the suggested point
+            mean, std = optimizer.models[-1].predict([next_point], return_std=True)
+            
+            # The objective is negative lutein, so flip the sign for prediction
+            predicted_lutein = -mean[0]
+            uncertainty = std[0]
+
+            def callback():
+                names = [d.name for d in get_current_dimensions()]
+                suggestion_html = "<h5>Preview of Next Suggestion:</h5>"
+                suggestion_html += f"<b>Predicted Lutein: {predicted_lutein:.4f} ± {uncertainty:.4f} g/L</b><ul>"
+                for name, val in zip(names, next_point):
+                    suggestion_html += f"<li><b>{name}:</b> {val:.4f}</li>"
+                suggestion_html += "</ul><p><i>Note: This is the model's prediction. Click 'Run One Optimization Step' to perform this experiment and see the actual result.</i></p>"
+                suggestion_div.text = suggestion_html
+                update_status("💡 Preview received.")
+                set_ui_state()
+            doc.add_next_tick_callback(callback)
+        except Exception as e:
+            doc.add_next_tick_callback(lambda: update_status(f"❌ Error getting preview: {e}"))
+            doc.add_next_tick_callback(set_ui_state)
+            
+    threading.Thread(target=worker).start()
+
+def process_and_plot_latest_results(result):
+    """Finds the best result from the optimizer object and updates plots."""
+    if not result: return
+    
+    best_params, best_obj_val = result.x, result.fun
+    max_lutein = -best_obj_val
+    optimal_params = {dim.name: val for dim, val in zip(get_current_dimensions(), best_params)}
+
+    results_html = f"<h3>Overall Best Result</h3>"
+    results_html += f"<b>Maximum Lutein Found:</b> {max_lutein:.4f} g/L<br/>"
+    results_html += "<b>Corresponding Parameters:</b><ul>"
+    for param, value in optimal_params.items(): results_html += f"<li><b>{param}:</b> {value:.4f}</li>"
+    results_html += "</ul>"
+    results_div.text = results_html
+    
+    update_convergence_plot_from_history()
+    run_final_simulation(best_params)
+
+def update_convergence_plot_from_history():
+    """Recalculates and updates the entire convergence plot from the history."""
+    num_initial = n_initial_input.value
+    # Correctly identify optimization steps as points AFTER the initial ones
+    opt_history = optimization_history[num_initial:]
+    if not opt_history:
+        convergence_source.data = dict(iter=[], best_lutein=[])
+        return
+        
+    iters = list(range(1, len(opt_history) + 1))
+    best_lutein_so_far = []
+    
+    # Find best result from the initial points to serve as the starting point for the plot
+    initial_points_history = optimization_history[:num_initial]
+    current_best = -min(p[1] for p in initial_points_history) if initial_points_history else -np.inf
+
+    for _, y_val in opt_history:
+        lutein_val = -y_val
+        if lutein_val > current_best: current_best = lutein_val
+        best_lutein_so_far.append(current_best)
+        
+    convergence_source.data = {'iter': iters, 'best_lutein': best_lutein_so_far}
+
+def run_final_simulation(best_params):
+    """Runs and plots a full simulation using the provided parameter set."""
+    global C_x0_model, C_N0_model, F_in_model, C_N_in_model, I0_model
+    C_x0_model, C_N0_model, F_in_model, C_N_in_model, I0_model = best_params
+    
+    t_eval = np.linspace(0, 150, 300)
+    initial_conditions = [best_params[0], best_params[1], 0.0]
+    sol = solve_ivp(pbr, [0, 150], initial_conditions, t_eval=t_eval, method="RK45")
+    
+    # Clip values at 0 to prevent plotting negative concentrations from numerical noise
+    # and scale Lutein for better visibility.
+    simulation_source.data = {
+        "time": sol.t, 
+        "C_X": np.maximum(0, sol.y[0]), 
+        "C_N": np.maximum(0, sol.y[1]), 
+        "C_L": np.maximum(0, sol.y[2]),
+        "C_L_scaled": np.maximum(0, sol.y[2]) * 100
+    }
+
+def update_status(message): status_div.text = message
+
+# --- UI Widgets ---
 title_div = Div(text="<h1>Lutein Production Bayesian Optimizer</h1>")
-description_p = Paragraph(
-    text="""
-    This application uses Bayesian Optimization to find the optimal operating conditions
-    for a photobioreactor to maximize lutein production. Adjust the optimizer settings
-    below and click 'Start Optimization' to begin.
-    """, width=400
-)
+description_p = Paragraph(text="""This application uses Bayesian Optimization to find the optimal operating conditions for a photobioreactor. Follow the steps to run a virtual experiment.""", width=450)
 
-surrogate_select = Select(
-    title="Surrogate Model (Regressor):",
-    value="GP",
-    options=[
-        ("GP", "Gaussian Process"),
-        ("RF", "Random Forest"),
-        ("ET", "Extra Trees"),
-    ],
-)
-acq_func_select = Select(
-    title="Acquisition Function:",
-    value="gp_hedge",
-    options=[
-        ("gp_hedge", "GP Hedge (Automatic)"),
-        ("EI", "Expected Improvement"),
-        ("PI", "Probability of Improvement"),
-        ("LCB", "Lower Confidence Bound"),
-    ],
-)
-sampler_select = Select(
-    title="Initial Sampling Method:",
-    value="lhs",
-    options=[
-        ("lhs", "Latin Hypercube (LHS)"),
-        ("sobol", "Sobol Sequence"),
-        ("random", "Random Sampling"),
-    ],
-)
-n_calls_input = Spinner(
-    title="Total Optimization Iterations:",
-    low=2, step=1, value=50, width=150
-)
-n_initial_input = Spinner(
-    title="Number of Initial Points:",
-    low=1, step=1, value=10, width=150
-)
-start_button = Button(label="Start Optimization", button_type="success", width=400)
-start_button.on_click(run_optimization)
+# Step 1: Parameter Ranges
+param_range_title = Div(text="<h4>1. Define Parameter Search Space</h4>")
+cx0_range = RangeSlider(title="C_x0 Range (g/L)", start=0, end=10, value=(0.2, 2.0), step=0.1)
+cn0_range = RangeSlider(title="C_N0 Range (g/L)", start=0, end=10, value=(0.2, 2.0), step=0.1)
+fin_range = RangeSlider(title="F_in Range", start=1e-5, end=1.5e-1, value=(1e-3, 1.5e-2), step=1e-4, format="0.0000")
+cnin_range = RangeSlider(title="C_N_in Range (g/L)", start=0, end=50, value=(5.0, 15.0), step=0.5)
+i0_range = RangeSlider(title="I0 Range (umol/m2-s)", start=0, end=1000, value=(100, 200), step=10)
 
-status_div = Div(text="🟢 Ready to start.")
+# Step 2: Sampler Settings
+settings_title = Div(text="<h4>2. Configure Initial Sampling & Model</h4>")
+surrogate_select = Select(title="Surrogate Model:", value="GP", options=["GP", "RF", "ET"])
+acq_func_select = Select(title="Acquisition Function:", value="gp_hedge", options=["gp_hedge", "EI", "PI", "LCB"])
+sampler_select = Select(title="Sampling Method:", value="LHS", options=["LHS", "Sobol", "Random"])
+n_initial_input = Spinner(title="Number of Initial Points:", low=1, step=1, value=10, width=150)
+param_and_settings_widgets = [cx0_range, cn0_range, fin_range, cnin_range, i0_range, surrogate_select, acq_func_select, sampler_select, n_initial_input]
+
+# Step 3: Experiment Workflow
+actions_title = Div(text="<h4>3. Run Experiment Workflow</h4>")
+generate_button = Button(label="A) Generate Initial Points", button_type="primary", width=400)
+calculate_button = Button(label="B) Calculate Lutein for Initial Points", button_type="default", width=400)
+optimize_button = Button(label="C) Run One Optimization Step", button_type="success", width=400)
+preview_button = Button(label="D) Preview Next Suggestion", button_type="warning", width=400)
+suggestion_div = Div(text="", width=400)
+reset_button = Button(label="Reset Experiment", button_type="danger", width=400)
+all_buttons = [generate_button, calculate_button, optimize_button, preview_button, reset_button]
+
+generate_button.on_click(generate_initial_points)
+calculate_button.on_click(calculate_lutein_for_table)
+optimize_button.on_click(run_one_optimization_step)
+preview_button.on_click(preview_next_suggestion)
+reset_button.on_click(reset_experiment)
+
+status_div = Div(text="🟢 Ready. Define parameters and generate initial points.")
 results_div = Div(text="")
 
-control_widgets = [
-    surrogate_select,
-    acq_func_select,
-    sampler_select,
-    n_calls_input,
-    n_initial_input,
-]
+# --- Data Table & Plots ---
+columns = [TableColumn(field=name, title=name, formatter=NumberFormatter(format="0.0000")) for name in experiments_source.data.keys()]
+data_table = DataTable(source=experiments_source, columns=columns, width=800, height=280, editable=False)
 
-controls = column(
-    title_div,
-    description_p,
-    surrogate_select,
-    acq_func_select,
-    sampler_select,
-    row(n_calls_input, n_initial_input),
-    start_button,
-    status_div,
-    results_div,
-    width=420,
-)
+p_conv = figure(height=300, width=800, title="Optimizer Convergence", x_axis_label="Optimization Step", y_axis_label="Max Lutein Found (g/L)", y_range=DataRange1d(start=0))
+p_conv.line(x="iter", y="best_lutein", source=convergence_source, line_width=2)
 
-# --- Plots ---
-# Convergence Plot
-p_conv = figure(
-    height=400,
-    width=600,
-    title="Optimization Convergence",
-    x_axis_label="Iteration",
-    y_axis_label="Max Lutein Found (g/L)",
-)
-p_conv.line(
-    x="iter", y="best_lutein", source=convergence_source, line_width=2,
-    legend_label="Best Objective"
-)
-p_conv.legend.location = "bottom_right"
+p_sim = figure(height=300, width=800, title="Simulation with Best Parameters", x_axis_label="Time (hours)", y_axis_label="Biomass & Nitrate Conc. (g/L)", y_range=DataRange1d(start=0))
+p_sim.extra_y_ranges = {"lutein_range": DataRange1d(start=0)}
+p_sim.add_layout(LinearAxis(y_range_name="lutein_range", axis_label="Lutein Conc. (x100) [g/L]"), 'right')
 
-# Final Simulation Plot
-p_sim = figure(
-    height=400,
-    width=600,
-    title="Simulation with Optimal Parameters",
-    x_axis_label="Time (hours)",
-    y_axis_label="Concentration (g/L)",
-)
 p_sim.line(x="time", y="C_X", source=simulation_source, color="green", line_width=2, legend_label="Biomass (C_X)")
 p_sim.line(x="time", y="C_N", source=simulation_source, color="blue", line_width=2, legend_label="Nitrate (C_N)")
-p_sim.line(x="time", y="C_L", source=simulation_source, color="orange", line_width=3, legend_label="Lutein (C_L)")
+p_sim.line(x="time", y="C_L_scaled", source=simulation_source, color="orange", line_width=3, legend_label="Lutein (C_L)", y_range_name="lutein_range")
 p_sim.legend.location = "top_left"
-p_sim.legend.click_policy = "hide" # Allows toggling lines on/off
-
+p_sim.legend.click_policy = "hide"
 
 # --- Layout ---
-plots = column(p_conv, p_sim)
-layout = row(controls, plots)
+controls_col = column(
+    title_div, description_p,
+    param_range_title, cx0_range, cn0_range, fin_range, cnin_range, i0_range,
+    settings_title, surrogate_select, acq_func_select, sampler_select, n_initial_input,
+    actions_title, generate_button, calculate_button, optimize_button, preview_button, suggestion_div, reset_button,
+    status_div,
+    width=470,
+)
+results_col = column(data_table, results_div, p_conv, p_sim)
+layout = row(controls_col, results_col)
 doc.add_root(layout)
+
+# Initialize UI
+set_ui_state()
