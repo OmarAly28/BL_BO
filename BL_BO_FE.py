@@ -228,7 +228,7 @@ def run_one_optimization_step():
             lutein_val = -obj_val
             
             # 3. Tell the optimizer the result so it can learn
-            opt_result = optimizer.tell(point_to_run, obj_val)
+            optimizer.tell(point_to_run, obj_val)
             
             # 4. Update our own history and UI
             optimization_history.append([point_to_run, obj_val])
@@ -239,9 +239,13 @@ def run_one_optimization_step():
                     'C_N_in': [point_to_run[3]], 'I0': [point_to_run[4]], 'Lutein': [lutein_val]
                 }
                 experiments_source.stream(new_point_data)
-                update_status(f"✅ Step {len(optimization_history)} complete. New Lutein: {lutein_val:.4f} g/L")
+                
+                # FIX 1: Correctly calculate the optimization step number
+                opt_step_number = len(optimization_history) - n_initial_input.value
+                update_status(f"✅ Optimization Step {opt_step_number} complete. New Lutein: {lutein_val:.4f} g/L")
+                
                 suggestion_div.text = "" # Clear any old previews
-                process_and_plot_latest_results(opt_result)
+                process_and_plot_latest_results()
                 set_ui_state()
             doc.add_next_tick_callback(callback)
 
@@ -288,15 +292,18 @@ def preview_next_suggestion():
             
     threading.Thread(target=worker).start()
 
-def process_and_plot_latest_results(result):
-    """Finds the best result from the optimizer object and updates plots."""
-    if not result: return
+def process_and_plot_latest_results():
+    """Finds the best result from the history and updates plots."""
+    if not optimization_history: return
     
-    best_params, best_obj_val = result.x, result.fun
+    # FIX 2: Find the best result from the history, not the optimizer object
+    best_item = min(optimization_history, key=lambda item: item[1])
+    best_params, best_obj_val = best_item[0], best_item[1]
+    
     max_lutein = -best_obj_val
     optimal_params = {dim.name: val for dim, val in zip(get_current_dimensions(), best_params)}
 
-    results_html = f"<h3>Overall Best Result</h3>"
+    results_html = f"<h3>Overall Best Result So Far</h3>"
     results_html += f"<b>Maximum Lutein Found:</b> {max_lutein:.4f} g/L<br/>"
     results_html += "<b>Corresponding Parameters:</b><ul>"
     for param, value in optimal_params.items(): results_html += f"<li><b>{param}:</b> {value:.4f}</li>"
@@ -402,7 +409,7 @@ p_sim.add_layout(LinearAxis(y_range_name="lutein_range", axis_label="Lutein Conc
 
 p_sim.line(x="time", y="C_X", source=simulation_source, color="green", line_width=2, legend_label="Biomass (C_X)")
 p_sim.line(x="time", y="C_N", source=simulation_source, color="blue", line_width=2, legend_label="Nitrate (C_N)")
-p_sim.line(x="time", y="C_L_scaled", source=simulation_source, color="orange", line_width=3, legend_label="Lutein (C_L)", y_range_name="lutein_range")
+p_sim.line(x="time", y="C_L_scaled", source=simulation_source, color="orange", line_width=3, legend_label="Lutein (C_L) x100", y_range_name="lutein_range")
 p_sim.legend.location = "top_left"
 p_sim.legend.click_policy = "hide"
 
