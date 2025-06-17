@@ -20,6 +20,7 @@ from bokeh.models import (
     RangeSlider,
     LinearAxis,
     DataRange1d,
+    NumeralTickFormatter,
 )
 
 # --- 1. Define Model Parameters (Constants of the Lutein system) ---
@@ -359,7 +360,7 @@ settings_title = Div(text="<h4>2. Configure Initial Sampling & Model</h4>")
 surrogate_select = Select(title="Surrogate Model:", value="GP", options=["GP", "RF", "ET"])
 acq_func_select = Select(title="Acquisition Function:", value="gp_hedge", options=["gp_hedge", "EI", "PI", "LCB"])
 sampler_select = Select(title="Sampling Method:", value="LHS", options=["LHS", "Sobol", "Random"])
-n_initial_input = Spinner(title="Number of Initial Points:", low=1, step=1, value=5, width=150)
+n_initial_input = Spinner(title="Number of Initial Points:", low=1, step=1, value=10, width=150)
 param_and_settings_widgets = [cx0_range, cn0_range, fin_range, cnin_range, i0_range, surrogate_select, acq_func_select, sampler_select, n_initial_input]
 
 # Step 3: Experiment Workflow
@@ -385,7 +386,8 @@ results_div = Div(text="")
 columns = [TableColumn(field=name, title=name, formatter=NumberFormatter(format="0.0000")) for name in experiments_source.data.keys()]
 data_table = DataTable(source=experiments_source, columns=columns, width=800, height=280, editable=False)
 
-p_conv = figure(height=300, width=800, title="Optimizer Convergence", x_axis_label="Optimization Step", y_axis_label="Max Lutein Found (g/L)", y_range=DataRange1d(start=0))
+p_conv = figure(height=300, width=800, title="Optimizer Convergence", x_axis_label="Optimization Step", y_axis_label="Max Lutein Found (g/L)", y_range=DataRange1d(start=0, range_padding=0.1, range_padding_units='percent'))
+p_conv.xaxis.formatter = NumeralTickFormatter(format="0")
 p_conv.line(x="iter", y="best_lutein", source=convergence_source, line_width=2)
 
 p_sim = figure(height=300, width=800, title="Simulation with Best Parameters", x_axis_label="Time (hours)", y_axis_label="Biomass & Nitrate Conc. (g/L)", y_range=DataRange1d(start=0))
@@ -413,3 +415,4 @@ doc.add_root(layout)
 
 # Initialize UI
 set_ui_state()
+
