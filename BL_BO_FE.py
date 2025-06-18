@@ -21,6 +21,7 @@ from bokeh.models import (
     LinearAxis,
     DataRange1d,
     NumeralTickFormatter,
+    FixedTicker,
 )
 
 # --- 1. Define Model Parameters (Constants of the Lutein system) ---
@@ -329,6 +330,9 @@ def update_convergence_plot_from_history():
         best_lutein_so_far.append(current_best)
         
     convergence_source.data = {'iter': iters, 'best_lutein': best_lutein_so_far}
+    # FIX: Explicitly set the ticks on the x-axis to be integers
+    p_conv.xaxis.ticker = FixedTicker(ticks=iters)
+
 
 def run_final_simulation(best_params):
     """Runs and plots a full simulation using the provided parameter set."""
@@ -415,4 +419,3 @@ doc.add_root(layout)
 
 # Initialize UI
 set_ui_state()
-
